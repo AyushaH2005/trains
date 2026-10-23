@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harbour line PESP timetable</title>
+<style>
+:root{--bg:#fff;--fg:#1d2330;--mut:#667;--card:#f5f6f8;--bd:#dde0e6;--acc:#2a5bd7;--l1:#d6452f;--l2:#1f8a5b;--l3:#8a4fd1}
+@media (prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e8eaf0;--mut:#9aa1b2;--card:#1d2129;--bd:#2f3542;--acc:#6b93ff}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg);padding:16px;max-width:1100px;margin:auto}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:18px 0 8px}.mut{color:var(--mut)}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--mut);gap:2px}
+input{padding:5px 7px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--fg);font-size:14px}
+button{padding:8px 16px;border:0;border-radius:8px;background:var(--acc);color:#fff;font-size:14px;cursor:pointer}
+button.sec{background:var(--card);color:var(--fg);border:1px solid var(--bd)}button:disabled{opacity:.5}
+table{border-collapse:collapse;width:100%}td,th{padding:4px 8px;border-bottom:1px solid var(--bd);text-align:left;font-size:13px}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;color:#fff;font-size:12px}
+.l1{background:var(--l1)}.l2{background:var(--l2)}.l3{background:var(--l3)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:800px){.two{grid-template-columns:1fr}}
+.scroll{max-height:320px;overflow:auto}pre{white-space:pre-wrap;font-size:12px;margin:0}
+</style></head><body>
+<h1>Harbour line periodic timetable (PESP → MILP)</h1>
+<div class="mut">CSMT – Vadala Road – Panvel / Andheri · period 60 min · solved by CBC on the Flask backend</div>
+
+<h2>Parameters</h2>
+<div class="card"><div class="grid" id="params"></div>
+<div class="row" style="margin-top:10px"><button id="go">Solve MILP</button><span id="msg" class="mut"></span></div></div>
+
+<div id="out" hidden>
+<h2>Result</h2><div class="card row" id="stats"></div>
+
+<h2>Rake movement (animated, repeats every hour)</h2>
+<div class="card">
+ <svg id="net" viewBox="0 0 640 330" width="100%"></svg>
+ <div class="row"><button class="sec" id="play">Play</button>
+  <input type="range" id="tm" min="0" max="179" value="0" style="flex:1"><b id="clk">0:00</b>
+  <label style="flex-direction:row;align-items:center;gap:6px">speed<input id="spd" type="range" min="1" max="10" value="3" style="width:80px"></label></div>
+ <div class="mut" id="cnt"></div>
+</div>
+
+<div class="two">
+ <div><h2>Timetable (minutes past the hour)</h2><div class="card scroll"><table id="tt"></table></div></div>
+ <div><h2>Rake count per station, by time of hour</h2><div class="card"><svg id="occ" viewBox="0 0 400 170" width="100%"></svg></div></div>
+</div>
+
+<h2>Rake rosters (links arrival → next departure)</h2><div class="card scroll" id="ros"></div>
+
+<h2>MILP formulation</h2>
+<details class="card"><summary>Show model</summary><pre>
+Sets: trips s (L1: n1 out + n1 in, L2: n2 out + n2 in, L3: n3 each way). T = 60.
+Variables: x_s ∈ {0..59} departure minute at origin terminal; h_s ∈ [2,4] halt at VDLR (Line 3);
+ p ∈ Z (modulo wrap, one per constraint); y_ad ∈ {0,1} arrival a → departure d link; w_ad turnaround time; N ∈ Z fleet.
+Running times: CSMT–VDLR 17, VDLR–PNVL 63, VDLR–ADH 25 (event time = x_s + offset).
+
+min N
+(1) Frequency: sort x of each line/direction; gaps x_{k+1}-x_k ∈ [lo,hi] (and cyclic wrap 60 + x_1 - x_n).
+(2) Track headway, for every pair (u,v) of trains entering the same track in the same direction:
+      3 ≤ (x_v + o_v) − (x_u + o_u) + 60·p_uv ≤ 57
+(3) Turnaround at terminal r (CSMT: exactly 3; PNVL, ADH: 5..10):
+      Σ_d y_ad = 1 ∀ arrivals a,  Σ_a y_ad = 1 ∀ departures d
+      dep_d − arr_a + 60·q_ad − w_ad = 0  if y_ad = 1 (big-M),   lo·y ≤ w ≤ hi·y
+(4) Fleet: Σ running times + Σ w_ad + Σ h_s = 60·N   (vehicle-minutes per hour = 60 × rakes)
+Rake rosters = cycles of the arrival→departure links y; a roster of length 60·m is run by m rakes spaced one hour apart.
+</pre></details>
+</div>
+<script>
+const FIELDS=[["n1","Line 1 services/h (CSMT–PNVL)",5],["n2","Line 2 services/h (CSMT–ADH)",3],["n3","Line 3 services/h (PNVL–ADH)",1],
+["headway","Track headway (min)",3],["gap_lo","L1 spacing min",10],["gap_hi","L1 spacing max",14],
+["pn_min","PNVL turnaround min",5],["pn_max","PNVL turnaround max",10],["ad_min","ADH turnaround min",5],["ad_max","ADH turnaround max",10],
+["halt_min","VDLR halt min (L3)",2],["halt_max","VDLR halt max (L3)",4],["tlimit","Solver time limit (s)",60]];
+const $=id=>document.getElementById(id);
+$("params").innerHTML=FIELDS.map(([k,l,v])=>`<label>${l}<input id="${k}" type="number" value="${v}"></label>`).join("");
+const FALLBACK={"status":"Optimal","rakes":22,"solve_time":1.53,"n_vars":467,"n_cons":729,"trips":[{"id":"L1o0","line":1,"frm":"CSMT","to":"PNVL","dep":0,"legs":[["CSMT","VDLR",0,17],["VDLR","PNVL",17,80]],"dur":80},{"id":"L2i0","line":2,"frm":"ADH","to":"CSMT","dep":0,"legs":[["ADH","VDLR",0,25],["VDLR","CSMT",25,42]],"dur":42},{"id":"L2o0","line":2,"frm":"CSMT","to":"ADH","dep":9,"legs":[["CSMT","VDLR",0,17],["VDLR","ADH",17,42]],"dur":42},{"id":"L1i0","line":1,"frm":"PNVL","to":"CSMT","dep":11,"legs":[["PNVL","VDLR",0,63],["VDLR","CSMT",63,80]],"dur":80},{"id":"L1o1","line":1,"frm":"CSMT","to":"PNVL","dep":12,"legs":[["CSMT","VDLR",0,17],["VDLR","PNVL",17,80]],"dur":80},{"id":"L3p0","line":3,"frm":"PNVL","to":"ADH","dep":14,"legs":[["PNVL","VDLR",0,63],["VDLR","VDLR",63,65],["VDLR","ADH",65,90]],"dur":90},{"id":"L1o2","line":1,"frm":"CSMT","to":"PNVL","dep":22,"legs":[["CSMT","VDLR",0,17],["VDLR","PNVL",17,80]],"dur":80},{"id":"L2i1","line":2,"frm":"ADH","to":"CSMT","dep":24,"legs":[["ADH","VDLR",0,25],["VDLR","CSMT",25,42]],"dur":42},{"id":"L1i1","line":1,"frm":"PNVL","to":"CSMT","dep":25,"legs":[["PNVL","VDLR",0,63],["VDLR","CSMT",63,80]],"dur":80},{"id":"L3a0","line":3,"frm":"ADH","to":"PNVL","dep":32,"legs":[["ADH","VDLR",0,25],["VDLR","VDLR",25,27],["VDLR","PNVL",27,90]],"dur":90},{"id":"L1o3","line":1,"frm":"CSMT","to":"PNVL","dep":34,"legs":[["CSMT","VDLR",0,17],["VDLR","PNVL",17,80]],"dur":80},{"id":"L1i2","line":1,"frm":"PNVL","to":"CSMT","dep":37,"legs":[["PNVL","VDLR",0,63],["VDLR","CSMT",63,80]],"dur":80},{"id":"L2o1","line":2,"frm":"CSMT","to":"ADH","dep":37,"legs":[["CSMT","VDLR",0,17],["VDLR","ADH",17,42]],"dur":42},{"id":"L2o2","line":2,"frm":"CSMT","to":"ADH","dep":45,"legs":[["CSMT","VDLR",0,17],["VDLR","ADH",17,42]],"dur":42},{"id":"L1o4","line":1,"frm":"CSMT","to":"PNVL","dep":48,"legs":[["CSMT","VDLR",0,17],["VDLR","PNVL",17,80]],"dur":80},{"id":"L1i3","line":1,"frm":"PNVL","to":"CSMT","dep":49,"legs":[["PNVL","VDLR",0,63],["VDLR","CSMT",63,80]],"dur":80},{"id":"L2i2","line":2,"frm":"ADH","to":"CSMT","dep":52,"legs":[["ADH","VDLR",0,25],["VDLR","CSMT",25,42]],"dur":42},{"id":"L1i4","line":1,"frm":"PNVL","to":"CSMT","dep":59,"legs":[["PNVL","VDLR",0,63],["VDLR","CSMT",63,80]],"dur":80}],"cycles":[{"id":0,"L":1320,"start0":0,"steps":[{"trip":"L1o0","line":1,"frm":"CSMT","to":"PNVL","dep":0,"arr":80,"turn":5},{"trip":"L1i1","line":1,"frm":"PNVL","to":"CSMT","dep":85,"arr":165,"turn":3},{"trip":"L1o4","line":1,"frm":"CSMT","to":"PNVL","dep":168,"arr":248,"turn":6},{"trip":"L3p0","line":3,"frm":"PNVL","to":"ADH","dep":254,"arr":344,"turn":8},{"trip":"L2i2","line":2,"frm":"ADH","to":"CSMT","dep":352,"arr":394,"turn":3},{"trip":"L2o1","line":2,"frm":"CSMT","to":"ADH","dep":397,"arr":439,"turn":5},{"trip":"L2i1","line":2,"frm":"ADH","to":"CSMT","dep":444,"arr":486,"turn":3},{"trip":"L2o0","line":2,"frm":"CSMT","to":"ADH","dep":489,"arr":531,"turn":9},{"trip":"L2i0","line":2,"frm":"ADH","to":"CSMT","dep":540,"arr":582,"turn":3},{"trip":"L2o2","line":2,"frm":"CSMT","to":"ADH","dep":585,"arr":627,"turn":5},{"trip":"L3a0","line":3,"frm":"ADH","to":"PNVL","dep":632,"arr":722,"turn":9},{"trip":"L1i0","line":1,"frm":"PNVL","to":"CSMT","dep":731,"arr":811,"turn":3},{"trip":"L1o3","line":1,"frm":"CSMT","to":"PNVL","dep":814,"arr":894,"turn":5},{"trip":"L1i4","line":1,"frm":"PNVL","to":"CSMT","dep":899,"arr":979,"turn":3},{"trip":"L1o2","line":1,"frm":"CSMT","to":"PNVL","dep":982,"arr":1062,"turn":7},{"trip":"L1i3","line":1,"frm":"PNVL","to":"CSMT","dep":1069,"arr":1149,"turn":3},{"trip":"L1o1","line":1,"frm":"CSMT","to":"PNVL","dep":1152,"arr":1232,"turn":5},{"trip":"L1i2","line":1,"frm":"PNVL","to":"CSMT","dep":1237,"arr":1317,"turn":3}],"segs":[{"s":0,"e":17,"a":"CSMT","b":"VDLR","line":1},{"s":17,"e":80,"a":"VDLR","b":"PNVL","line":1},{"s":80,"e":85,"a":"PNVL","b":"PNVL","line":1},{"s":85,"e":148,"a":"PNVL","b":"VDLR","line":1},{"s":148,"e":165,"a":"VDLR","b":"CSMT","line":1},{"s":165,"e":168,"a":"CSMT","b":"CSMT","line":1},{"s":168,"e":185,"a":"CSMT","b":"VDLR","line":1},{"s":185,"e":248,"a":"VDLR","b":"PNVL","line":1},{"s":248,"e":254,"a":"PNVL","b":"PNVL","line":1},{"s":254,"e":317,"a":"PNVL","b":"VDLR","line":3},{"s":317,"e":319,"a":"VDLR","b":"VDLR","line":3},{"s":319,"e":344,"a":"VDLR","b":"ADH","line":3},{"s":344,"e":352,"a":"ADH","b":"ADH","line":3},{"s":352,"e":377,"a":"ADH","b":"VDLR","line":2},{"s":377,"e":394,"a":"VDLR","b":"CSMT","line":2},{"s":394,"e":397,"a":"CSMT","b":"CSMT","line":2},{"s":397,"e":414,"a":"CSMT","b":"VDLR","line":2},{"s":414,"e":439,"a":"VDLR","b":"ADH","line":2},{"s":439,"e":444,"a":"ADH","b":"ADH","line":2},{"s":444,"e":469,"a":"ADH","b":"VDLR","line":2},{"s":469,"e":486,"a":"VDLR","b":"CSMT","line":2},{"s":486,"e":489,"a":"CSMT","b":"CSMT","line":2},{"s":489,"e":506,"a":"CSMT","b":"VDLR","line":2},{"s":506,"e":531,"a":"VDLR","b":"ADH","line":2},{"s":531,"e":540,"a":"ADH","b":"ADH","line":2},{"s":540,"e":565,"a":"ADH","b":"VDLR","line":2},{"s":565,"e":582,"a":"VDLR","b":"CSMT","line":2},{"s":582,"e":585,"a":"CSMT","b":"CSMT","line":2},{"s":585,"e":602,"a":"CSMT","b":"VDLR","line":2},{"s":602,"e":627,"a":"VDLR","b":"ADH","line":2},{"s":627,"e":632,"a":"ADH","b":"ADH","line":2},{"s":632,"e":657,"a":"ADH","b":"VDLR","line":3},{"s":657,"e":659,"a":"VDLR","b":"VDLR","line":3},{"s":659,"e":722,"a":"VDLR","b":"PNVL","line":3},{"s":722,"e":731,"a":"PNVL","b":"PNVL","line":3},{"s":731,"e":794,"a":"PNVL","b":"VDLR","line":1},{"s":794,"e":811,"a":"VDLR","b":"CSMT","line":1},{"s":811,"e":814,"a":"CSMT","b":"CSMT","line":1},{"s":814,"e":831,"a":"CSMT","b":"VDLR","line":1},{"s":831,"e":894,"a":"VDLR","b":"PNVL","line":1},{"s":894,"e":899,"a":"PNVL","b":"PNVL","line":1},{"s":899,"e":962,"a":"PNVL","b":"VDLR","line":1},{"s":962,"e":979,"a":"VDLR","b":"CSMT","line":1},{"s":979,"e":982,"a":"CSMT","b":"CSMT","line":1},{"s":982,"e":999,"a":"CSMT","b":"VDLR","line":1},{"s":999,"e":1062,"a":"VDLR","b":"PNVL","line":1},{"s":1062,"e":1069,"a":"PNVL","b":"PNVL","line":1},{"s":1069,"e":1132,"a":"PNVL","b":"VDLR","line":1},{"s":1132,"e":1149,"a":"VDLR","b":"CSMT","line":1},{"s":1149,"e":1152,"a":"CSMT","b":"CSMT","line":1},{"s":1152,"e":1169,"a":"CSMT","b":"VDLR","line":1},{"s":1169,"e":1232,"a":"VDLR","b":"PNVL","line":1},{"s":1232,"e":1237,"a":"PNVL","b":"PNVL","line":1},{"s":1237,"e":1300,"a":"PNVL","b":"VDLR","line":1},{"s":1300,"e":1317,"a":"VDLR","b":"CSMT","line":1},{"s":1317,"e":1320,"a":"CSMT","b":"CSMT","line":1}],"rakes":["R1","R2","R3","R4","R5","R6","R7","R8","R9","R10","R11","R12","R13","R14","R15","R16","R17","R18","R19","R20","R21","R22"]}],"fleet":[{"name":"R1","cycle":0,"shift":0},{"name":"R2","cycle":0,"shift":60},{"name":"R3","cycle":0,"shift":120},{"name":"R4","cycle":0,"shift":180},{"name":"R5","cycle":0,"shift":240},{"name":"R6","cycle":0,"shift":300},{"name":"R7","cycle":0,"shift":360},{"name":"R8","cycle":0,"shift":420},{"name":"R9","cycle":0,"shift":480},{"name":"R10","cycle":0,"shift":540},{"name":"R11","cycle":0,"shift":600},{"name":"R12","cycle":0,"shift":660},{"name":"R13","cycle":0,"shift":720},{"name":"R14","cycle":0,"shift":780},{"name":"R15","cycle":0,"shift":840},{"name":"R16","cycle":0,"shift":900},{"name":"R17","cycle":0,"shift":960},{"name":"R18","cycle":0,"shift":1020},{"name":"R19","cycle":0,"shift":1080},{"name":"R20","cycle":0,"shift":1140},{"name":"R21","cycle":0,"shift":1200},{"name":"R22","cycle":0,"shift":1260}],"dwell_total":88};
+const XY={CSMT:[60,170],VDLR:[250,170],PNVL:[580,285],ADH:[480,45]},COL={1:"#d6452f",2:"#1f8a5b",3:"#8a4fd1"};
+let D=null,timer=null;
+const fmt=m=>{m=Math.floor(m);return Math.floor(m/60)+":"+String(m%60).padStart(2,"0")},mm=m=>String(((m%60)+60)%60).padStart(2,"0");
+async function callBackend(body){
+  for(const base of ["","http://127.0.0.1:5000"]){
+    try{const r=await fetch(base+"/api/solve",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      if((r.headers.get("content-type")||"").includes("json"))return await r.json();}catch(e){}
+  }
+  return null}
+$("go").onclick=async()=>{
+  const body={};FIELDS.forEach(([k])=>body[k]=+$(k).value);
+  $("go").disabled=true;$("msg").textContent="Solving…";
+  D=await callBackend(body);$("go").disabled=false;
+  if(!D){D=FALLBACK;$("msg").innerHTML="<b>Backend not reachable</b> – showing the precomputed base case (5/3/1 services). Start it with <code>python app.py</code> and open <code>http://127.0.0.1:5000</code> to re-solve with your parameters.";}
+  else if(D.error){$("msg").textContent=D.error;$("out").hidden=true;return}
+  else $("msg").textContent="";
+  $("out").hidden=false;render();startPlay();
+};
+function startPlay(){if(!timer)$("play").onclick()}
+function render(){
+  $("stats").innerHTML=`<span><b>${D.rakes}</b> rakes</span><span>status: ${D.status}</span><span>${D.n_vars} vars · ${D.n_cons} constraints</span><span>solved in ${D.solve_time}s</span><span>total dwell ${D.dwell_total} min/h</span>`;
+  // timetable
+  const rows=D.trips.map(t=>{const vd=t.legs.find(l=>l[1]==="VDLR"&&l[0]!=="VDLR");
+    return `<tr><td><span class="pill l${t.line}">L${t.line}</span></td><td>${t.frm}→${t.to}</td><td><b>${mm(t.dep)}</b></td><td>${mm(t.dep+vd[3])}</td><td>${mm(t.dep+t.dur)}</td></tr>`}).join("");
+  $("tt").innerHTML=`<tr><th>Line</th><th>Trip</th><th>Departs</th><th>VDLR</th><th>Arrives</th></tr>`+rows;
+  // rosters
+  $("ros").innerHTML=D.cycles.map(c=>`<div style="margin-bottom:10px"><b>Roster ${c.id+1}</b> · ${c.rakes.length} rakes (${c.rakes[0]}${c.rakes.length>1?"–"+c.rakes.at(-1):""}) · cycle ${c.L} min · next rake starts the same roster 60 min later<br>`+
+    c.steps.map(s=>`<span class="pill l${s.line}">${s.frm}</span> ${fmt(c.start0+s.dep)} → ${s.to} ${fmt(c.start0+s.arr)} <span class="mut">(turn ${s.turn}′)</span>`).join(" · ")+`</div>`).join("");
+  drawNet();occChart();tick(+$("tm").value);
+}
+function seg(r,t){const c=D.cycles[r.cycle],ph=(((t-r.shift)%c.L)+c.L)%c.L;
+  for(const s of c.segs)if(ph>=s.s&&ph<s.e){const f=(ph-s.s)/(s.e-s.s);return{a:s.a,b:s.b,f,line:s.line,dwell:s.a===s.b}}
+  const s=c.segs[0];return{a:s.a,b:s.a,f:0,line:s.line,dwell:true}}
+const ORD={CSMT:0,VDLR:1,PNVL:2,ADH:3};
+function pos(g){const A=XY[g.a],B=XY[g.b];let x=A[0]+(B[0]-A[0])*g.f,y=A[1]+(B[1]-A[1])*g.f;
+  if(g.a!==g.b){const dx=B[0]-A[0],dy=B[1]-A[1],n=Math.hypot(dx,dy),sg=ORD[g.a]<ORD[g.b]?1:-1;x+=-dy/n*7*sg;y+=dx/n*7*sg}
+  return[x,y]}
+function drawNet(){
+  const e=[["CSMT","VDLR"],["VDLR","PNVL"],["VDLR","ADH"]];
+  let s=e.map(([a,b])=>{const A=XY[a],B=XY[b],dx=B[0]-A[0],dy=B[1]-A[1],n=Math.hypot(dx,dy),ox=-dy/n*7,oy=dx/n*7;
+    return [1,-1].map(k=>`<line x1="${A[0]+ox*k}" y1="${A[1]+oy*k}" x2="${B[0]+ox*k}" y2="${B[1]+oy*k}" stroke="#99a" stroke-width="2" stroke-dasharray="1 0"/>`).join("")}).join("");
+  s+=Object.entries(XY).map(([n,p])=>`<circle cx="${p[0]}" cy="${p[1]}" r="8" fill="var(--bg)" stroke="#667" stroke-width="3"/><text x="${p[0]}" y="${p[1]+(n==="ADH"?-16:24)}" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">${n}</text>`).join("");
+  s+=`<text x="150" y="150" text-anchor="middle" fill="#667" font-size="11">17′</text><text x="440" y="240" fill="#667" font-size="11">63′</text><text x="340" y="95" fill="#667" font-size="11">25′</text><g id="trains"></g>`;
+  $("net").innerHTML=s}
+function tick(t){
+  t=((t%180)+180)%180;$("tm").value=t;$("clk").textContent=fmt(t);
+  const by={},g=[];
+  D.fleet.forEach((r,i)=>{const q=seg(r,t),[x,y]=pos(q);const key=q.dwell?q.a:null;
+    let off=0;if(key){by[key]=(by[key]||0);off=by[key]++;}
+    const ox=key?(off%6)*11-27:0,oy=key?Math.floor(off/6)*11+(key==="ADH"?-26:12)+ (key==="ADH"?-Math.floor(off/6)*22:0):0;
+    g.push(`<circle cx="${x+ox}" cy="${y+oy}" r="${q.dwell?5:7}" fill="${COL[q.line]}" ${q.dwell?'opacity=".6"':'stroke="#fff" stroke-width="1.5"'}><title>${r.name}: ${q.dwell?"at "+q.a:q.a+"→"+q.b}</title></circle>`+(q.dwell?"":`<text x="${x+ox}" y="${y+oy+3}" text-anchor="middle" font-size="8" fill="#fff" font-weight="700">${r.name.slice(1)}</text>`))});
+  $("trains").innerHTML=g.join("");
+  const run=D.fleet.length-Object.values(by).reduce((a,b)=>a+b,0);
+  $("cnt").textContent=`${run} rakes running, `+Object.entries(by).map(([k,v])=>`${v} at ${k}`).join(", ");
+}
+function occChart(){ // rakes standing at each station over one hour
+  const st=["CSMT","VDLR","PNVL","ADH"],cols=["#4a6","#e90","#d33","#27c"],data=st.map(()=>[]);
+  for(let t=0;t<60;t++){const c=[0,0,0,0];D.fleet.forEach(r=>{const q=seg(r,t);if(q.dwell)c[st.indexOf(q.a)]++});c.forEach((v,i)=>data[i].push(v))}
+  const mx=Math.max(1,...data.flat());let s=`<line x1="30" y1="140" x2="390" y2="140" stroke="#889"/>`;
+  data.forEach((d,i)=>s+=`<polyline fill="none" stroke="${cols[i]}" stroke-width="2" points="${d.map((v,t)=>`${30+t*6},${140-v*120/mx}`).join(" ")}"/><text x="${40+i*85}" y="162" fill="${cols[i]}" font-size="12">● ${st[i]}</text>`);
+  s+=`<text x="4" y="24" fill="#889" font-size="11">${mx}</text><text x="4" y="144" fill="#889" font-size="11">0</text><text x="30" y="154" fill="#889" font-size="10">:00</text><text x="372" y="154" fill="#889" font-size="10">:59</text>`;
+  $("occ").innerHTML=s}
+$("tm").oninput=e=>tick(+e.target.value);
+$("play").onclick=()=>{if(timer){clearInterval(timer);timer=null;$("play").textContent="Play";return}
+  $("play").textContent="Pause";timer=setInterval(()=>tick(+$("tm").value+(+$("spd").value)*.25),50)};
+</script></body></html>
